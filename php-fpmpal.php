@@ -1,5 +1,6 @@
 <?php
 
+
 echo "\n";
 echo "\033[38;5;81m (        )  (         (     (       *                      \n";
 echo "\033[38;5;51m\033[1m )\ )  ( /(  )\ )      )\ )  )\ )  (  `           \033[33m\033[1m      (   \n";
@@ -30,13 +31,13 @@ function printHeader($title)
 // Function to execute shell commands and return the output
 function runCommand($command)
 {
-    $verbose = ($argv[1] ?? '') === '-v' ?? false;
+    global $argv;
+    $verbose = ($argv[1] ?? '') === '-v';
     $fullCommand = $command . ' 2>&1';
-    $commandDecorated = "\033[1m$fullCommand\033[0m";
     if ($verbose) {
-        echo "Running command: $commandDecorated\n";
+        echo "\033[1mRunning command:\033[0m $fullCommand\n";
     }
-    exec($command . ' 2>&1', $output, $returnVar);
+    exec($fullCommand, $output, $returnVar);
     return [$output, $returnVar];
 }
 
@@ -46,7 +47,7 @@ function checkPhpFpm()
     $phpFpmInstalled = false;
     $processName = '';
 
-    $versions = ['php-fpm', 'php5-fpm', 'php-fpm7.2'];
+    $versions = ['php-fpm', 'php5-fpm', 'php-fpm7.2', 'php-fpm8.0', 'php-fpm8.1'];
     foreach ($versions as $version) {
         [$output, $returnVar] = runCommand("$version -v");
         if ($returnVar === 0) {
@@ -73,24 +74,51 @@ function getFpmConfigFiles($processName)
         exit(1);
     }
 
-    $configFiles = [];
+    $mainConfigFile = '';
     foreach ($output as $line) {
         if (preg_match('/configuration file\s*(.+)/', $line, $matches)) {
-            $configFiles[] = trim($matches[1]);
+            $mainConfigFile = trim($matches[1]);
         }
-        if (preg_match('/included configuration file.*:\s*(.+)/', $line, $matches)) {
-            $configFiles[] = trim($matches[1]);
+    }
+
+    if (empty($mainConfigFile)) {
+        echo "\033[31mFailed to retrieve PHP-FPM configuration files. Ensure PHP-FPM is accessible.\033[0m\n";
+        exit(1);
+    }
+
+    $configFiles = [];
+
+    [$output] = runCommand("grep -E 'include=|prefix' $mainConfigFile");
+
+    $prefix = '/';
+    foreach ($output as $line) {
+        if (preg_match('/prefix\s*\(([^)]+)\)/', $line, $matches)) {
+            $prefix = rtrim(trim($matches[1]), '/') . '/';
+            continue;
         }
+    }
+    foreach ($output as $line) {
+        if (preg_match('/include\s*=\s*(.*)/', $line, $matches)) {
+            $includePath = $prefix . rtrim(trim($matches[1]), '/');
+            foreach (glob($includePath) as $includedFile) {
+                $configFiles[] = $includedFile;
+            }
+        }
+    }
+
+    if (empty($configFiles)) {
+        echo "\033[31mNo PHP-FPM configuration files found. Exiting.\033[0m\n";
+        exit(1);
     }
 
     return $configFiles;
 }
 
-// Function to extract a configuration value for a specific pool
+// Function to retrieve specific configuration values for a pool
 function getConfigValue($pool, $configKey, $configFiles)
 {
     foreach ($configFiles as $file) {
-        if (strpos($file, $pool) !== false) {
+        if (str_contains($file, $pool)) {
             [$output] = runCommand("grep '$configKey' $file | awk -F'=' '{print $2}' | sed 's/ //g'");
             return intval($output[0] ?? 0);
         }
@@ -99,7 +127,62 @@ function getConfigValue($pool, $configKey, $configFiles)
     return 0;
 }
 
-// Function to calculate memory usage of processes
+// Function to display PHP-FPM version and status
+function displayPhpFpmInfo($processName)
+{
+    printHeader('PHP-FPM General Information');
+
+    // Get PHP-FPM version
+    [$versionOutput] = runCommand("$processName -v");
+    echo "\033[36mVersion:\033[0m " . ($versionOutput[0] ?? 'Unknown') . "\n";
+
+    // Check if PHP-FPM service is running
+    [$statusOutput] = runCommand("ps aux | grep '$processName' | grep -v grep");
+    $isRunning = count($statusOutput) > 0;
+    echo "\033[36mStatus:\033[0m " . ($isRunning ? "\033[32mRunning\033[0m" : "\033[31mNot Running\033[0m") . "\n";
+}
+
+// Function to display detailed pool configurations
+function getDetailedPoolConfig($pool, $configFiles)
+{
+    $keys = ['pm.start_servers', 'pm.min_spare_servers', 'pm.max_spare_servers', 'pm.max_requests'];
+    $config = [];
+    
+    foreach ($keys as $key) {
+        $config[$key] = getConfigValue($pool, $key, $configFiles);
+    }
+
+    return $config;
+}
+
+function displayDetailedPoolConfigs($processName, $configFiles)
+{
+    printHeader('PHP-FPM Pool Configuration Details');
+
+    [$pools] = runCommand("ps aux | grep '$processName' | grep -v grep | grep pool | awk '{print $13}' | sort | uniq");
+    if (empty($pools)) {
+        echo "\033[33mNo active PHP-FPM pools detected.\033[0m\n";
+        return;
+    }
+
+    foreach ($pools as $pool) {
+        echo "\033[36mPool: $pool\033[0m\n";
+
+        $config = getDetailedPoolConfig($pool, $configFiles);
+
+        foreach ($configFiles as $file) {
+            if (str_contains($file, $pool)) {
+                echo "\t\033[1m$file\033[0m\n";
+            }
+        }
+
+        foreach ($config as $key => $value) {
+            echo "\t$key: \033[1m$value\033[0m\n";
+        }
+    }
+}
+
+// Function to calculate memory usage
 function getLargestProcessMemory($pids)
 {
     $largestMemory = 0;
@@ -115,10 +198,23 @@ function getLargestProcessMemory($pids)
     return $largestMemory; // Memory in KB
 }
 
-// Function to display PHP-FPM pool information
-function displayPoolInformation($processName, $configFiles)
+function getAverageProcessMemory($pids)
 {
-    printHeader('List of PHP-FPM pools');
+    $totalMemory = 0;
+    $processCount = count($pids);
+
+    foreach ($pids as $pid) {
+        [$output] = runCommand("pmap -d $pid | grep 'writeable/private' | awk '{print $4}' | sed 's/K//'");
+        $memory = intval($output[0] ?? 0);
+        $totalMemory += $memory;
+    }
+
+    return $processCount > 0 ? $totalMemory / $processCount : 0; // Memory in KB
+}
+
+function displayMemoryBreakdown($processName, $configFiles)
+{
+    printHeader('Memory Breakdown Per Pool');
 
     [$pools] = runCommand("ps aux | grep '$processName' | grep -v grep | grep pool | awk '{print $13}' | sort | uniq");
     if (empty($pools)) {
@@ -131,45 +227,48 @@ function displayPoolInformation($processName, $configFiles)
 
         [$pids] = runCommand("ps aux | grep '$processName' | grep -v grep | grep '$pool' | awk '{print $2}'");
 
-        $largestProcessMemory = getLargestProcessMemory($pids);
-        $maxChildren = getConfigValue($pool, 'pm.max_children', $configFiles);
-        $totalPotentialMemory = $largestProcessMemory * $maxChildren;
+        $largestMemory = getLargestProcessMemory($pids);
+        $averageMemory = getAverageProcessMemory($pids);
+        $totalMemory = $largestMemory * count($pids);
 
-        echo "\tProcesses: " . count($pids) . "\n";
-        echo "\tLargest process in this pool (KB): \033[1m$largestProcessMemory KB\033[0m\n";
-        echo "\tTotal potential memory usage (KB): \033[1m$totalPotentialMemory KB\033[0m\n";
+        echo "\tLargest Process Memory (KB): \033[1m$largestMemory\033[0m\n";
+        echo "\tAverage Process Memory (KB): \033[1m$averageMemory\033[0m\n";
+        echo "\tTotal Memory Used by Pool (KB): \033[1m$totalMemory\033[0m\n";
     }
 }
 
-// Function to display server memory usage
-function displayServerMemoryInformation()
+// Function to display active connections
+function displayActiveConnections($processName)
 {
-    printHeader('Server memory usage statistics');
+    printHeader('Active Connections Per Pool');
 
-    $totalMemory = 0;
-    if (file_exists('/proc/meminfo')) {
-        $lines = file('/proc/meminfo');
-        foreach ($lines as $line) {
-            if (strpos($line, 'MemTotal') === 0) {
-                $parts = preg_split('/\s+/', $line);
-                $totalMemory = intval($parts[1]) / 1024; // Convert to MB
-                break;
-            }
-        }
+    [$pools] = runCommand("ps aux | grep '$processName' | grep -v grep | grep pool | awk '{print $13}' | sort | uniq");
+    if (empty($pools)) {
+        echo "\033[33mNo active PHP-FPM pools detected.\033[0m\n";
+        return;
     }
 
-    echo "Total server memory: \033[1m$totalMemory MB\033[0m\n";
+    foreach ($pools as $pool) {
+        echo "\033[36mPool: $pool\033[0m\n";
 
-    [$availableMemory] = runCommand("free -m | awk '/Mem/ {print $7}'");
-    $availableMemory = intval($availableMemory[0] ?? 0);
-
-    echo "Available memory for PHP-FPM: \033[1m$availableMemory MB\033[0m\n";
+        [$connections] = runCommand("ps aux | grep '$processName' | grep -v grep | grep '$pool' | wc -l");
+        echo "\tActive Connections: \033[1m" . ($connections[0] ?? '0') . "\033[0m\n";
+    }
 }
 
-// Function to display pool-specific recommendations
-function displayRecommendationsPerPool($processName, $configFiles)
+// Function to display error logs
+function displayErrorLogs($processName)
 {
-    printHeader('Recommendations per pool');
+    printHeader('PHP-FPM Error Logs');
+
+    [$logs] = runCommand("journalctl -u $processName | tail -n 10");
+    echo implode("\n", $logs) . "\n";
+}
+
+// Function to display recommendations
+function displayRecommendations($processName, $configFiles)
+{
+    printHeader('Performance Tuning Recommendations');
 
     [$pools] = runCommand("ps aux | grep '$processName' | grep -v grep | grep pool | awk '{print $13}' | sort | uniq");
     if (empty($pools)) {
@@ -181,16 +280,12 @@ function displayRecommendationsPerPool($processName, $configFiles)
         echo "\033[36mPool: $pool\033[0m\n";
 
         [$pids] = runCommand("ps aux | grep '$processName' | grep -v grep | grep '$pool' | awk '{print $2}'");
-        $largestProcessMemory = getLargestProcessMemory($pids);
+        $largestMemory = getLargestProcessMemory($pids);
 
         [$availableMemory] = runCommand("free -m | awk '/Mem/ {print $7}'");
-        $availableMemory = intval($availableMemory[0] ?? 0);
-
-        $recommendedMaxChildren = intval(($availableMemory * 1024) / $largestProcessMemory);
-        $maxChildren = getConfigValue($pool, 'pm.max_children', $configFiles);
+        $recommendedMaxChildren = intval(($availableMemory[0] * 1024) / $largestMemory);
 
         echo "\tRecommended max_children: \033[1m$recommendedMaxChildren\033[0m\n";
-        echo "\tCurrent max_children: \033[1m$maxChildren\033[0m\n";
     }
 }
 
@@ -200,14 +295,12 @@ function main()
     $processName = checkPhpFpm();
     $configFiles = getFpmConfigFiles($processName);
 
-    printHeader('Loaded PHP-FPM Configuration Files');
-    foreach ($configFiles as $file) {
-        echo "\t$file\n";
-    }
-
-    displayPoolInformation($processName, $configFiles);
-    displayServerMemoryInformation();
-    displayRecommendationsPerPool($processName, $configFiles);
+    displayPhpFpmInfo($processName);
+    displayDetailedPoolConfigs($processName, $configFiles);
+    displayMemoryBreakdown($processName, $configFiles);
+    displayActiveConnections($processName);
+    displayErrorLogs($processName);
+    displayRecommendations($processName, $configFiles);
 }
 
 // Entry point
